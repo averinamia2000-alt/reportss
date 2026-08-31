@@ -137,8 +137,21 @@ async def send_report(chat_id, project, typ, offset):
 
 @router.message()
 async def source(m:Message):
+    # Temporary discovery log: lets us learn SOURCE_CHAT_ID and message_thread_id
+    # before those values are configured in Railway.
+    if m.chat.type in ("group", "supergroup"):
+        logging.info(
+            "TELEGRAM DEBUG | chat_id=%s | thread_id=%s | message_id=%s | text=%r",
+            m.chat.id,
+            m.message_thread_id,
+            m.message_id,
+            (m.text or m.caption or "")[:100],
+        )
+
     typ=rtype(m.message_thread_id)
-    if m.chat.id != settings.source_chat_id or not typ: return
+    if m.chat.id != settings.source_chat_id or not typ:
+        return
+
     logging.info("source chat=%s thread=%s message=%s",m.chat.id,m.message_thread_id,m.message_id)
     text=m.text or m.caption or ""
     project=detect_project(text)
