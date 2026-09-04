@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import settings
 from db import init_db, Session, Report, ReportMessage
@@ -25,6 +25,36 @@ def original_url(chat_id, message_id):
     s=str(chat_id)
     if s.startswith("-100"): return f"https://t.me/c/{s[4:]}/{message_id}"
     return None
+
+
+
+def parse_telegram_message_url(url: str):
+    """Parse private-supergroup Telegram links: /c/<chat>/<message> or /c/<chat>/<topic>/<message>."""
+    import re
+    m=re.search(r"https?://t\.me/c/(\d+)/(?:\d+/)?(\d+)(?:\?.*)?$", (url or "").strip())
+    if not m:
+        return None, None
+    return int("-100" + m.group(1)), int(m.group(2))
+
+def thread_for_type(report_type: str):
+    return {
+        "global": settings.global_thread_id,
+        "operational": settings.operational_thread_id,
+        "monthly": settings.monthly_thread_id,
+    }.get(report_type)
+
+async def replace_report_version(s, rep: Report, *, source_chat_id: int, source_thread_id: int, message_id: int, sender_id, sender_username, received_at):
+    """Keep the same logical report row, but point it at the newest Telegram publication."""
+    rep.source_chat_id=source_chat_id
+    rep.source_thread_id=source_thread_id
+    rep.first_message_id=message_id
+    rep.sender_id=sender_id
+    rep.sender_username=sender_username
+    rep.received_at=received_at
+    await s.execute(delete(ReportMessage).where(ReportMessage.report_id==rep.id))
+    s.add(ReportMessage(report_id=rep.id,message_id=message_id,position=0))
+    await s.flush()
+    return rep.id
 
 async def deny(event):
     if isinstance(event, Message): await event.answer("⛔ У вас нет доступа к этому боту.")
@@ -116,6 +146,73 @@ async def missing_cmd(m:Message):
 @router.message(Command("whoami"))
 async def whoami(m:Message): await m.answer(f"Ваш Telegram user_id: <code>{m.from_user.id}</code>", parse_mode="HTML")
 
+@router.message(Command("reindex"))
+async def reindex_cmd(m:Message):
+    if m.from_user.id != settings.admin_user_id:
+        return await deny(m)
+    if not m.reply_to_message:
+        return await m.answer(
+            "Перешлите существующий отчёт боту, затем ответьте на него командой:\n"
+            "<code>/reindex global ССЫЛКА_НА_ОРИГИНАЛ</code>",
+            parse_mode="HTML",
+        )
+    parts=(m.text or "").split(maxsplit=2)
+    report_type=parts[1].lower() if len(parts)>1 else "global"
+    aliases={"глобал":"global","global":"global","операционный":"operational","operational":"operational","monthly":"monthly","месячный":"monthly"}
+    report_type=aliases.get(report_type)
+    if not report_type:
+        return await m.answer("Тип отчёта: global, operational или monthly")
+    url=parts[2].strip() if len(parts)>2 else ""
+    source_chat_id,message_id=parse_telegram_message_url(url)
+    if not source_chat_id or not message_id:
+        return await m.answer(
+            "Добавьте ссылку на исходное сообщение. Например:\n"
+            "<code>/reindex global https://t.me/c/2640153163/1234</code>",
+            parse_mode="HTML",
+        )
+    if source_chat_id != settings.source_chat_id:
+        return await m.answer("Эта ссылка ведёт не в настроенную группу с отчётами.")
+    src=m.reply_to_message
+    text=src.text or src.caption or ""
+    project=detect_project(text)
+    if not project:
+        return await m.answer("Не смог определить проект в пересланном отчёте.")
+    now=datetime.now(ZoneInfo(settings.timezone))
+    ps,pe=parse_period(text,now.date())
+    if not ps or not pe:
+        return await m.answer("Не смог определить период отчёта. Проверьте, что в тексте есть диапазон дат.")
+    source_thread_id=thread_for_type(report_type)
+    async with Session() as s:
+        q=select(Report).where(
+            Report.project==project, Report.report_type==report_type,
+            Report.period_start==ps, Report.period_end==pe
+        ).order_by(Report.received_at.desc()).limit(1)
+        rep=(await s.execute(q)).scalar_one_or_none()
+        if rep:
+            report_id=await replace_report_version(
+                s,rep,source_chat_id=source_chat_id,source_thread_id=source_thread_id,
+                message_id=message_id,sender_id=m.from_user.id,
+                sender_username=m.from_user.username,received_at=now,
+            )
+        else:
+            rep=Report(
+                project=project,report_type=report_type,period_start=ps,period_end=pe,
+                source_chat_id=source_chat_id,source_thread_id=source_thread_id,
+                first_message_id=message_id,sender_id=m.from_user.id,
+                sender_username=m.from_user.username,received_at=now,
+            )
+            s.add(rep); await s.flush(); report_id=rep.id
+            s.add(ReportMessage(report_id=rep.id,message_id=message_id,position=0))
+        await s.commit()
+    if report_type=="global" and text:
+        await upsert_analysis(report_id,text,replace=True)
+    logging.info("reindexed %s %s %s message=%s",project,report_type,pe,message_id)
+    await m.answer(
+        f"✅ Обновлено: <b>{project}</b> · {report_type} · {ps:%d.%m.%Y}–{pe:%d.%m.%Y}\n"
+        "Теперь бот использует новую публикацию и новую ссылку на оригинал.",
+        parse_mode="HTML",
+    )
+
 @router.message(Command("digest"))
 async def digest_cmd(m:Message):
     if m.from_user.id != settings.admin_user_id: return await deny(m)
@@ -195,11 +292,29 @@ async def source(m:Message):
     async with Session() as s:
         if project:
             ps,pe=parse_period(text,m.date.astimezone(ZoneInfo(settings.timezone)).date())
-            rep=Report(project=project,report_type=typ,period_start=ps,period_end=pe,source_chat_id=m.chat.id,source_thread_id=m.message_thread_id,first_message_id=m.message_id,sender_id=m.from_user.id if m.from_user else None,sender_username=m.from_user.username if m.from_user else None,received_at=m.date)
-            s.add(rep); await s.flush(); report_id=rep.id; s.add(ReportMessage(report_id=rep.id,message_id=m.message_id,position=0)); await s.commit()
+            existing=None
+            if ps and pe:
+                q=select(Report).where(
+                    Report.project==project,Report.report_type==typ,
+                    Report.period_start==ps,Report.period_end==pe
+                ).order_by(Report.received_at.desc()).limit(1)
+                existing=(await s.execute(q)).scalar_one_or_none()
+            if existing:
+                report_id=await replace_report_version(
+                    s,existing,source_chat_id=m.chat.id,source_thread_id=m.message_thread_id,
+                    message_id=m.message_id,sender_id=m.from_user.id if m.from_user else None,
+                    sender_username=m.from_user.username if m.from_user else None,received_at=m.date,
+                )
+                action="replaced"
+            else:
+                rep=Report(project=project,report_type=typ,period_start=ps,period_end=pe,source_chat_id=m.chat.id,source_thread_id=m.message_thread_id,first_message_id=m.message_id,sender_id=m.from_user.id if m.from_user else None,sender_username=m.from_user.username if m.from_user else None,received_at=m.date)
+                s.add(rep); await s.flush(); report_id=rep.id
+                s.add(ReportMessage(report_id=rep.id,message_id=m.message_id,position=0))
+                action="indexed"
+            await s.commit()
             if typ == "global" and text:
                 await upsert_analysis(report_id,text,replace=True)
-            logging.info("indexed %s %s %s",project,typ,pe)
+            logging.info("%s %s %s %s",action,project,typ,pe)
         else:
             q=select(Report).where(Report.source_chat_id==m.chat.id,Report.source_thread_id==m.message_thread_id).order_by(Report.received_at.desc()).limit(1)
             rep=(await s.execute(q)).scalar_one_or_none()
