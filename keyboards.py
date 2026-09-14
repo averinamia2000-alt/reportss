@@ -15,7 +15,12 @@ def type_kb(project):
 def period_kb(project, typ):
     b=InlineKeyboardBuilder(); b.button(text="Эта неделя",callback_data=f"r:{project}:{typ}:0"); b.button(text="Предыдущая",callback_data=f"r:{project}:{typ}:1"); b.button(text="🏠 Главное меню",callback_data="home"); b.adjust(2,1); return b.as_markup()
 
-def after_kb(project, typ=None):
-    b=InlineKeyboardBuilder(); b.button(text="📁 Другой проект",callback_data="home")
-    if typ: b.button(text="📅 Другой период",callback_data=f"t:{project}:{typ}")
-    b.button(text="🏠 Главное меню",callback_data="home"); b.adjust(1); return b.as_markup()
+def after_kb(project, typ=None, offset=0):
+    b=InlineKeyboardBuilder()
+    if typ:
+        b.button(text="📈 Динамика", callback_data=f"d:{project}:{typ}:{offset}")
+        if typ != "monthly":
+            b.button(text="📅 Другой период",callback_data=f"t:{project}:{typ}")
+    b.button(text="📁 Другой проект",callback_data="home")
+    b.button(text="🏠 Главное меню",callback_data="home")
+    b.adjust(1); return b.as_markup()
