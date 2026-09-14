@@ -27,6 +27,15 @@ def parse_period(text: str | None, received: date):
     if year2 < 100: year2 += 2000
     year1=int(y1) if y1 else year2
     if year1 < 100: year1 += 2000
+
+    # If neither side contains a year, infer it from the received date.
+    # Handle New Year ranges such as 29.12–05.01 correctly.
+    if not y1 and not y2:
+        m1=int(m.group("m1")); m2=int(m.group("m2"))
+        if m1 > m2:
+            year1=received.year - 1 if received.month <= 2 else received.year
+            year2=year1 + 1
+
     try:
         return date(year1,int(m.group("m1")),int(m.group("d1"))), date(year2,int(m.group("m2")),int(m.group("d2")))
     except ValueError:
