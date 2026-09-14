@@ -7,7 +7,22 @@ def projects_kb():
     b.adjust(2); return b.as_markup()
 
 def cadence_kb(project):
-    b=InlineKeyboardBuilder(); b.button(text="📅 Weekly",callback_data=f"c:{project}:w"); b.button(text="🗓 Monthly",callback_data=f"c:{project}:m"); b.button(text="🏠 Главное меню",callback_data="home"); b.adjust(2,1); return b.as_markup()
+    b=InlineKeyboardBuilder()
+    b.button(text="📅 Weekly", callback_data=f"c:{project}:w")
+    b.button(text="🗓 Monthly", callback_data=f"c:{project}:m")
+    b.button(text="📈 Динамика", callback_data=f"dm:{project}")
+    b.button(text="🏠 Главное меню", callback_data="home")
+    b.adjust(2, 1, 1)
+    return b.as_markup()
+
+def dynamics_kb(project):
+    b=InlineKeyboardBuilder()
+    b.button(text="🌐 Глобал", callback_data=f"d:{project}:global:0")
+    b.button(text="🗓 Месячный", callback_data=f"d:{project}:monthly:0")
+    b.button(text="⬅️ Назад", callback_data=f"p:{project}")
+    b.button(text="🏠 Главное меню", callback_data="home")
+    b.adjust(2, 1, 1)
+    return b.as_markup()
 
 def type_kb(project):
     b=InlineKeyboardBuilder(); b.button(text="🌐 Глобал",callback_data=f"t:{project}:global"); b.button(text="⚙️ Операционный",callback_data=f"t:{project}:operational"); b.button(text="🏠 Главное меню",callback_data="home"); b.adjust(2,1); return b.as_markup()
@@ -17,10 +32,9 @@ def period_kb(project, typ):
 
 def after_kb(project, typ=None, offset=0):
     b=InlineKeyboardBuilder()
-    if typ:
-        b.button(text="📈 Динамика", callback_data=f"d:{project}:{typ}:{offset}")
-        if typ != "monthly":
-            b.button(text="📅 Другой период",callback_data=f"t:{project}:{typ}")
-    b.button(text="📁 Другой проект",callback_data="home")
-    b.button(text="🏠 Главное меню",callback_data="home")
-    b.adjust(1); return b.as_markup()
+    if typ and typ != "monthly":
+        b.button(text="📅 Другой период", callback_data=f"t:{project}:{typ}")
+    b.button(text="📁 Другой проект", callback_data="home")
+    b.button(text="🏠 Главное меню", callback_data="home")
+    b.adjust(1)
+    return b.as_markup()
