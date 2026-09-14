@@ -126,30 +126,53 @@ async def reindex_cmd(m:Message):
     if not m.reply_to_message:
         return await m.answer(
             "Перешлите существующий отчёт боту, затем ответьте на него командой:\n"
-            "<code>/reindex global ССЫЛКА_НА_ОРИГИНАЛ</code>",
+            "<code>/reindex global Winum ССЫЛКА_НА_ОРИГИНАЛ</code>\n\n"
+            "Проект можно не указывать — тогда бот попробует определить его из текста отчёта.",
             parse_mode="HTML",
         )
-    parts=(m.text or "").split(maxsplit=2)
+
+    parts=(m.text or "").split()
     report_type=parts[1].lower() if len(parts)>1 else "global"
     aliases={"глобал":"global","global":"global","операционный":"operational","operational":"operational","monthly":"monthly","месячный":"monthly"}
     report_type=aliases.get(report_type)
     if not report_type:
         return await m.answer("Тип отчёта: global, operational или monthly")
-    url=parts[2].strip() if len(parts)>2 else ""
+
+    # Последний аргумент всегда ссылка. Всё между типом и ссылкой — явное имя проекта.
+    url=parts[-1].strip() if len(parts)>2 else ""
+    explicit_project=" ".join(parts[2:-1]).strip() if len(parts)>3 else ""
     source_chat_id,message_id=parse_telegram_message_url(url)
     if not source_chat_id or not message_id:
         return await m.answer(
             "Добавьте ссылку на исходное сообщение. Например:\n"
-            "<code>/reindex global https://t.me/c/2640153163/1234</code>",
+            "<code>/reindex global Winum https://t.me/c/2640153163/1234</code>",
             parse_mode="HTML",
         )
     if source_chat_id != settings.source_chat_id:
         return await m.answer("Эта ссылка ведёт не в настроенную группу с отчётами.")
+
     src=m.reply_to_message
     text=src.text or src.caption or ""
-    project=detect_project(text)
-    if not project:
-        return await m.answer("Не смог определить проект в пересланном отчёте.")
+
+    project=None
+    if explicit_project:
+        needle=explicit_project.casefold()
+        for p in PROJECTS:
+            if p["name"].casefold()==needle or needle in [a.casefold() for a in p.get("aliases",[])]:
+                project=p["name"]
+                break
+        if not project:
+            names=", ".join(p["name"] for p in PROJECTS)
+            return await m.answer(f"Неизвестный проект: <b>{explicit_project}</b>\n\nДоступные проекты: {names}", parse_mode="HTML")
+    else:
+        project=detect_project(text)
+        if not project:
+            return await m.answer(
+                "Не смог определить проект в отчёте. Укажите его явно, например:\n"
+                "<code>/reindex global Winum ССЫЛКА_НА_ОРИГИНАЛ</code>",
+                parse_mode="HTML",
+            )
+
     now=datetime.now(ZoneInfo(settings.timezone))
     ps,pe=parse_period(text,now.date())
     if not ps or not pe:
