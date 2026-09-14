@@ -12,7 +12,7 @@ from parser import detect_project, parse_period
 from projects import BY_NAME, PROJECTS
 from keyboards import projects_kb, cadence_kb, type_kb, period_kb, after_kb
 from deadlines import weekly_period, monthly_period, deadline_for, missing_projects, fmt_period
-from analytics import upsert_analysis, build_digest
+from analytics import upsert_analysis, build_period_delta
 
 router=Router()
 
@@ -82,39 +82,12 @@ async def send_missing_digest(report_type: str):
     else:
         logging.warning("ADMIN_USER_ID is not set; missing digest: %s", text)
 
-async def send_portfolio_digest():
-    now=datetime.now(ZoneInfo(settings.timezone))
-    ps,pe=weekly_period("global",now)
-    text=await build_digest(ps,pe)
-    recipients=settings.digest_user_ids or ({settings.admin_user_id} if settings.admin_user_id else set())
-    if not recipients:
-        logging.warning("DIGEST_USER_IDS/ADMIN_USER_ID are not set; portfolio digest was not sent")
-        return
-    for uid in recipients:
-        try:
-            # Telegram limits a message to 4096 chars. Keep logical chunks readable.
-            chunks=[]
-            current=""
-            for line in text.split("\n"):
-                candidate=(current+"\n"+line).strip()
-                if len(candidate)>3900 and current:
-                    chunks.append(current); current=line
-                else:
-                    current=candidate
-            if current: chunks.append(current)
-            for chunk in chunks:
-                await bot.send_message(uid,chunk,parse_mode="HTML")
-        except Exception:
-            logging.exception("portfolio digest send failed for user %s",uid)
-
 async def setup_scheduler():
     scheduler=AsyncIOScheduler(timezone=settings.timezone)
     # Cyprus local time. Small 1-minute delay lets reports arriving exactly at deadline be committed first.
     scheduler.add_job(send_missing_digest,"cron",day_of_week="tue",hour=20,minute=1,args=["operational"],id="missing_operational",replace_existing=True)
     scheduler.add_job(send_missing_digest,"cron",day_of_week="fri",hour=20,minute=1,args=["global"],id="missing_global",replace_existing=True)
     scheduler.add_job(send_missing_digest,"cron",day=4,hour=12,minute=1,args=["monthly"],id="missing_monthly",replace_existing=True)
-    # Monday 11:00 Cyprus: Global Portfolio Health for the most recent Friday report period.
-    scheduler.add_job(send_portfolio_digest,"cron",day_of_week="mon",hour=11,minute=0,id="portfolio_digest",replace_existing=True)
     scheduler.start()
     return scheduler
 
@@ -204,7 +177,7 @@ async def reindex_cmd(m:Message):
             s.add(rep); await s.flush(); report_id=rep.id
             s.add(ReportMessage(report_id=rep.id,message_id=message_id,position=0))
         await s.commit()
-    if report_type=="global" and text:
+    if text:
         await upsert_analysis(report_id,text,replace=True)
     logging.info("reindexed %s %s %s message=%s",project,report_type,pe,message_id)
     await m.answer(
@@ -212,15 +185,6 @@ async def reindex_cmd(m:Message):
         "Теперь бот использует новую публикацию и новую ссылку на оригинал.",
         parse_mode="HTML",
     )
-
-@router.message(Command("digest"))
-async def digest_cmd(m:Message):
-    if m.from_user.id != settings.admin_user_id: return await deny(m)
-    now=datetime.now(ZoneInfo(settings.timezone))
-    ps,pe=weekly_period("global",now)
-    text=await build_digest(ps,pe)
-    for chunk_start in range(0,len(text),3900):
-        await m.answer(text[chunk_start:chunk_start+3900],parse_mode="HTML")
 
 @router.callback_query(F.data=="home")
 async def home(c:CallbackQuery):
@@ -250,6 +214,21 @@ async def report_cb(c:CallbackQuery):
     if not allowed(c.from_user.id): return await deny(c)
     _,p,t,offset=c.data.split(":"); await send_report(c.message.chat.id,p,t,int(offset)); await c.answer()
 
+@router.callback_query(F.data.startswith("d:"))
+async def dynamics_cb(c:CallbackQuery):
+    if not allowed(c.from_user.id): return await deny(c)
+    _, project, typ, offset = c.data.split(":")
+    text = await build_period_delta(project, typ, int(offset))
+    await c.message.answer(text, parse_mode="HTML")
+    await c.answer()
+
+def project_sites_html(project: str) -> str:
+    sites = BY_NAME[project].get("sites", [])
+    if not sites:
+        return "Ссылка на сайт: —"
+    links = ", ".join(f'<a href="{url}">{url.removeprefix("https://").rstrip("/")}</a>' for url in sites)
+    return f"Ссылка на сайт: {links}"
+
 async def send_report(chat_id, project, typ, offset):
     async with Session() as s:
         q=select(Report).where(Report.project==project,Report.report_type==typ).order_by(Report.period_end.desc().nullslast(),Report.received_at.desc()).offset(offset).limit(1)
@@ -262,12 +241,12 @@ async def send_report(chat_id, project, typ, offset):
         url=original_url(rep.source_chat_id,rep.first_message_id)
         kb=None
         if url: kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 Открыть оригинал",url=url)]])
-        await bot.send_message(chat_id,f"{label} · <b>{project}</b> · {period}",parse_mode="HTML",reply_markup=kb)
+        await bot.send_message(chat_id,f"{project_sites_html(project)}\n\n{label} · <b>{project}</b> · {period}",parse_mode="HTML",reply_markup=kb,disable_web_page_preview=True)
         msgs=(await s.execute(select(ReportMessage).where(ReportMessage.report_id==rep.id).order_by(ReportMessage.position))).scalars().all()
         for rm in msgs:
             try: await bot.copy_message(chat_id=chat_id,from_chat_id=rep.source_chat_id,message_id=rm.message_id)
             except Exception: logging.exception("copy_message failed")
-        await bot.send_message(chat_id,"Что дальше?",reply_markup=after_kb(project, typ if typ!='monthly' else None))
+        await bot.send_message(chat_id,"Что дальше?",reply_markup=after_kb(project, typ, offset))
 
 @router.message()
 async def source(m:Message):
@@ -322,7 +301,7 @@ async def source(m:Message):
                 pos=(await s.execute(select(func.count()).select_from(ReportMessage).where(ReportMessage.report_id==rep.id))).scalar_one()
                 report_id=rep.id
                 s.add(ReportMessage(report_id=rep.id,message_id=m.message_id,position=pos)); await s.commit()
-                if rep.report_type == "global" and text:
+                if text:
                     await upsert_analysis(report_id,text)
 
 async def main():
