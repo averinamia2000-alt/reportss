@@ -10,7 +10,7 @@ from config import settings
 from db import init_db, Session, Report, ReportMessage
 from parser import detect_project, parse_period
 from projects import BY_NAME, PROJECTS
-from keyboards import projects_kb, cadence_kb, type_kb, period_kb, after_kb
+from keyboards import projects_kb, cadence_kb, type_kb, period_kb, after_kb, dynamics_kb
 from deadlines import weekly_period, monthly_period, deadline_for, missing_projects, fmt_period
 from analytics import upsert_analysis, build_period_delta
 
@@ -213,6 +213,17 @@ async def typ(c:CallbackQuery):
 async def report_cb(c:CallbackQuery):
     if not allowed(c.from_user.id): return await deny(c)
     _,p,t,offset=c.data.split(":"); await send_report(c.message.chat.id,p,t,int(offset)); await c.answer()
+
+@router.callback_query(F.data.startswith("dm:"))
+async def dynamics_menu_cb(c: CallbackQuery):
+    if not allowed(c.from_user.id): return await deny(c)
+    project = c.data.split(":", 1)[1]
+    await c.message.edit_text(
+        f"📈 <b>Динамика · {project}</b>\nВыберите тип отчёта:",
+        parse_mode="HTML",
+        reply_markup=dynamics_kb(project),
+    )
+    await c.answer()
 
 @router.callback_query(F.data.startswith("d:"))
 async def dynamics_cb(c:CallbackQuery):
