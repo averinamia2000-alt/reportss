@@ -223,101 +223,55 @@ async def upsert_analysis(report_id: int, text: str, replace: bool = False):
         await s.commit()
 
 
-def fmt_change(m) -> str:
-    if m is None or m.change_value is None:
+
+def _fmt_number(value: float | None) -> str:
+    if value is None:
         return "—"
-    suffix = " п.п." if m.change_unit == "pp" else "%"
-    return f"{m.change_value:+.1f}{suffix}".replace(".", ",")
+    if abs(value) >= 1000:
+        return f"{value:,.0f}".replace(",", " ")
+    return f"{value:.2f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
-async def build_digest(period_start: date, period_end: date) -> str:
+def _delta_text(current: float | None, previous: float | None) -> str:
+    if current is None or previous is None:
+        return "—"
+    diff = current - previous
+    if previous == 0:
+        return f"{diff:+.2f}".replace(".", ",")
+    pct = diff / abs(previous) * 100
+    return f"{diff:+.2f} ({pct:+.1f}%)".replace(".", ",")
+
+
+async def build_period_delta(project: str, report_type: str, offset: int = 0) -> str:
+    """Compare the selected report with the immediately preceding report of the same type."""
     async with Session() as s:
-        reports = (await s.execute(select(Report).where(Report.report_type == "global", Report.period_start == period_start, Report.period_end == period_end).order_by(Report.received_at.desc()))).scalars().all()
-        latest = {}
-        for r in reports:
-            latest.setdefault(r.project, r)
+        reports = (await s.execute(
+            select(Report)
+            .where(Report.project == project, Report.report_type == report_type)
+            .order_by(Report.period_end.desc().nullslast(), Report.received_at.desc())
+            .offset(offset).limit(2)
+        )).scalars().all()
+        if len(reports) < 2:
+            return "Недостаточно данных: нужен предыдущий отчёт для сравнения."
+        current, previous = reports[0], reports[1]
+        current_metrics = (await s.execute(select(ReportMetric).where(
+            ReportMetric.report_id == current.id, ReportMetric.segment == "main"
+        ))).scalars().all()
+        previous_metrics = (await s.execute(select(ReportMetric).where(
+            ReportMetric.report_id == previous.id, ReportMetric.segment == "main"
+        ))).scalars().all()
 
-        rows = []
-        tag_counts = {}
-        positives = []
-        management = []
-        trends = []
-        counts = [0, 0, 0]
+    cur = {m.metric_key: m for m in current_metrics}
+    prev = {m.metric_key: m for m in previous_metrics}
+    keys = [k for k in LABELS if k in cur and k in prev and cur[k].value is not None and prev[k].value is not None]
+    if not keys:
+        return "Недостаточно распознанных метрик для расчёта динамики."
 
-        for p in PROJECTS:
-            name = p["name"]
-            rep = latest.get(name)
-            if not rep:
-                rows.append((name, 2, {}, "Global-отчёт не предоставлен"))
-                counts[2] += 1
-                management.append(f"{name} — Global-отчёт не предоставлен")
-                continue
-            metrics = (await s.execute(select(ReportMetric).where(ReportMetric.report_id == rep.id))).scalars().all()
-            insight = (await s.execute(select(ReportInsight).where(ReportInsight.report_id == rep.id))).scalar_one_or_none()
-            main = {m.metric_key: m for m in metrics if m.segment == "main"}
-            if len([k for k in CORE if k in main and main[k].change_value is not None]) < 2:
-                level, signal = 1, "недостаточно данных для полной оценки"
-            else:
-                level, signal = project_status(metrics, insight)
-            counts[level] += 1
-            rows.append((name, level, main, signal))
-            if insight:
-                for tag in filter(None, (insight.tags or "").split(",")):
-                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
-                if insight.management_attention and name not in " ".join(management):
-                    management.append(f"{name} — отмечена необходимость решения/эскалации")
-            if level == 2 and name not in " ".join(management):
-                management.append(f"{name} — {signal}")
-            ggr = main.get("ggr")
-            if ggr and ggr.change_value is not None and ggr.change_value >= 10:
-                positives.append((ggr.change_value, f"{name} — GGR {fmt_change(ggr)}"))
-
-            # Consecutive negative GGR/FD trend from stored history.
-            hist = (await s.execute(select(Report).where(Report.project == name, Report.report_type == "global", Report.period_end <= period_end).order_by(Report.period_end.desc()).limit(4))).scalars().all()
-            for key in ("ggr", "fd"):
-                seq = []
-                for hr in hist:
-                    hm = (await s.execute(select(ReportMetric).where(ReportMetric.report_id == hr.id, ReportMetric.metric_key == key, ReportMetric.segment == "main"))).scalar_one_or_none()
-                    if hm and hm.change_value is not None and hm.change_value < 0: seq.append(hm)
-                    else: break
-                if len(seq) >= 3:
-                    trends.append(f"{name} — {LABELS[key]} снижается {len(seq)} недели подряд")
-
-    status_emoji = ["🟢", "🟡", "🔴"]
-    lines = [
-        "📊 <b>Еженедельная сводка по проектам</b>",
-        f"{period_start:%d.%m}–{period_end:%d.%m.%Y}", "",
-        f"🟢 {counts[0]} — без существенных отклонений",
-        f"🟡 {counts[1]} — требуют внимания",
-        f"🔴 {counts[2]} — критическое отклонение / нет отчёта", "",
-        "<b>📋 Состояние проектов</b>",
-    ]
-    for name, level, main, signal in rows:
-        vals = " · ".join(f"{LABELS[k]} {fmt_change(main.get(k))}" for k in ("ggr", "deposits", "fd", "inout"))
-        lines.append(f"{status_emoji[level]} <b>{name}</b> — {vals}")
-        if level > 0:
-            lines.append(f"   ↳ {signal}")
-
-    exceptions = [r for r in rows if r[1] > 0]
-    if exceptions:
-        lines += ["", "<b>🔻 Основные отклонения</b>"]
-        for name, level, main, signal in exceptions[:6]:
-            lines.append(f"{status_emoji[level]} <b>{name}</b> — {signal}")
-
-    common = sorted(((n, t) for t, n in tag_counts.items() if n >= 2), reverse=True)
-    if common:
-        lines += ["", "<b>⚠️ Общие сигналы</b>"]
-        for n, tag in common[:5]: lines.append(f"• {tag} — {n} проекта")
-
-    if management:
-        lines += ["", "<b>🎯 Требует внимания руководства</b>"]
-        for i, x in enumerate(management[:5], 1): lines.append(f"{i}. {x}")
-
-    lines += ["", "<b>📈 Позитивные сигналы</b>"]
-    if positives:
-        for _, x in sorted(positives, reverse=True)[:3]: lines.append(f"• {x}")
-    lines.append(f"• {counts[0]} из {len(PROJECTS)} проектов без существенных отклонений")
-
-    if trends:
-        lines += ["", "<b>📉 Тренды</b>"] + [f"• {x}" for x in trends[:5]]
+    cadence = "месяц к месяцу" if report_type == "monthly" else "неделя к неделе"
+    cp = f"{current.period_start:%d.%m.%Y}–{current.period_end:%d.%m.%Y}" if current.period_start and current.period_end else "текущий период"
+    pp = f"{previous.period_start:%d.%m.%Y}–{previous.period_end:%d.%m.%Y}" if previous.period_start and previous.period_end else "предыдущий период"
+    lines = [f"📈 <b>Динамика: {project}</b>", f"{cadence}: {cp} vs {pp}", ""]
+    for key in keys:
+        c, p = cur[key].value, prev[key].value
+        lines.append(f"• <b>{LABELS[key]}</b>: {_fmt_number(c)} vs {_fmt_number(p)} · Δ {_delta_text(c, p)}")
     return "\n".join(lines)
